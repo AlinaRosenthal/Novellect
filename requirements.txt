@@ -1,0 +1,8 @@
+streamlit
+beautifulsoup4
+chardet
+PyPDF2
+ebooklib
+sentence-transformers
+scikit-learn
+numpy
