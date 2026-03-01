@@ -40,8 +40,26 @@ with st.sidebar:
 
     st.header("📊 Статистика")
     _, meta = engine.load_db()
-    books_count = len(set([m['book_id'] for m in meta])) if meta else 0
-    st.metric("Всего книг", books_count)
+    
+    if meta:
+        unique_books = {}
+        for m in meta:
+            book_id = m.get('book_id')
+            if book_id not in unique_books:
+                unique_books[book_id] = {
+                    "title": m.get('book_title', 'Без названия'),
+                    "format": m.get('format', 'unknown')
+                }
+        
+        st.metric("Всего книг", len(unique_books))
+        
+        with st.expander("📚 Список книг"):
+            for b_id, info in unique_books.items():
+                st.write(f"• {info['title']} ({info['format'].upper()})")
+    else:
+        st.metric("Всего книг", 0)
+        with st.expander("📚 Список книг"):
+            st.write("Библиотека пуста")
     
     if st.button("🗑️ Очистить индекс"):
         if os.path.exists('vector_db.npz'): os.remove('vector_db.npz')
