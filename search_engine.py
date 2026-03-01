@@ -2,19 +2,17 @@ import json
 import os
 import re
 import numpy as np
+import streamlit as st
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 
 STORAGE_FILE = 'storage.json'
 VECTOR_DB_FILE = 'vector_db.npz'
 
-_model_cache = None
-
+@st.cache_resource(show_spinner=False)
 def get_model():
-    global _model_cache
-    if _model_cache is None:
-        _model_cache = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
-    return _model_cache
+    model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+    return model
 
 def load_index():
     if not os.path.exists(STORAGE_FILE): 

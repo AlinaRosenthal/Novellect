@@ -92,51 +92,6 @@ def read_epub(file_path):
     except Exception as e:
         return {"title": os.path.basename(file_path), "content": "", "format": "epub", "error": str(e)}
 
-def chunk_text(text, max_chunk_size=1000, overlap=100):
-    if not text or len(text.strip()) == 0:
-        return []
-    
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    text = re.sub(r' +', ' ', text)
-    
-    paragraphs = text.split('\n\n')
-    paragraphs = [p.strip() for p in paragraphs if p.strip()]
-    
-    chunks = []
-    current_chunk = ""
-    
-    for paragraph in paragraphs:
-        if len(paragraph) > max_chunk_size:
-            sentences = re.split(r'(?<=[.!?])\s+', paragraph)
-            for sentence in sentences:
-                if len(current_chunk) + len(sentence) > max_chunk_size:
-                    if current_chunk:
-                        chunks.append(current_chunk.strip())
-                    current_chunk = sentence
-                else:
-                    if current_chunk:
-                        current_chunk += " " + sentence
-                    else:
-                        current_chunk = sentence
-        else:
-            if len(current_chunk) + len(paragraph) > max_chunk_size and current_chunk:
-                chunks.append(current_chunk.strip())
-                words = current_chunk.split()
-                overlap_text = ' '.join(words[-overlap:]) if len(words) > overlap else current_chunk
-                current_chunk = overlap_text + " " + paragraph
-            else:
-                if current_chunk:
-                    current_chunk += "\n\n" + paragraph
-                else:
-                    current_chunk = paragraph
-    
-    if current_chunk.strip():
-        chunks.append(current_chunk.strip())
-    
-    chunks = [c for c in chunks if len(c) > 50]
-    
-    return chunks
-
 def process_file(file_path):
     if not os.path.exists(file_path):
         return {"error": "Файл не найден"}
@@ -151,6 +106,7 @@ def process_file(file_path):
     }
     
     reader = readers.get(ext)
+    
     if not reader:
         return {
             "title": os.path.basename(file_path), 
@@ -160,9 +116,5 @@ def process_file(file_path):
         }
     
     book_data = reader(file_path)
-    
-    if not book_data.get('error') and book_data.get('content', '').strip():
-        book_data['chunks'] = chunk_text(book_data['content'])
-        book_data['chunks_count'] = len(book_data['chunks'])
-    
+  
     return book_data

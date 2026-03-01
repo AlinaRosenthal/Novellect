@@ -101,4 +101,4 @@ if query:
                 st.caption("Фрагмент текста с наибольшим совпадением")
 
 st.markdown("---")
-st.caption("Novellect Prototype 2 | Февраль 2024 | Семантический поиск по книгам")
+st.caption("Novellect Prototype 2 | Февраль 2026 | Семантический поиск по книгам")
