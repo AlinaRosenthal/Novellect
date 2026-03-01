@@ -1,120 +1,40 @@
 import os
-import xml.etree.ElementTree as ET
-from bs4 import BeautifulSoup
 import chardet
 import PyPDF2
+from bs4 import BeautifulSoup
 from ebooklib import epub
-import re
 
-def read_txt(file_path):
-    try:
-        with open(file_path, 'rb') as f:
-            raw_data = f.read()
-            result = chardet.detect(raw_data)
-            encoding = result['encoding'] if result['encoding'] else 'utf-8'
-        
-        with open(file_path, 'r', encoding=encoding, errors='ignore') as f:
-            text = f.read()
-        
-        text = re.sub(r'\r\n', '\n', text)
-        text = re.sub(r' +', ' ', text)
-        
-        title = os.path.splitext(os.path.basename(file_path))[0]
-        return {"title": title, "content": text, "format": "txt"}
-    except Exception as e:
-        return {"title": os.path.basename(file_path), "content": "", "format": "txt", "error": str(e)}
-
-def read_fb2(file_path):
-    try:
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-        
-        soup = BeautifulSoup(content, 'xml')
-        
-        title_info = soup.find('title-info')
-        book_title = "Неизвестно"
-        if title_info:
-            book_name_tag = title_info.find('book-title')
-            if book_name_tag:
-                book_title = book_name_tag.get_text().strip()
-        
-        body = soup.find('body')
-        text_content = ""
-        if body:
-            for tag in body.find_all(['p', 'title', 'subtitle', 'poem', 'stanza']):
-                text_content += tag.get_text().strip() + "\n\n"
-        
-        return {"title": book_title, "content": text_content, "format": "fb2"}
-    except Exception as e:
-        return {"title": os.path.basename(file_path), "content": "", "format": "fb2", "error": str(e)}
-
-def read_pdf(file_path):
-    try:
-        with open(file_path, 'rb') as f:
-            reader = PyPDF2.PdfReader(f)
-            text = ""
-            
-            for page_num in range(len(reader.pages)):
-                try:
-                    page_text = reader.pages[page_num].extract_text()
-                    if page_text:
-                        text += page_text + "\n"
-                except:
-                    continue
-            
-            title = "Неизвестно"
-            if reader.metadata and reader.metadata.get('/Title'):
-                title = reader.metadata.get('/Title')
-            else:
-                title = os.path.splitext(os.path.basename(file_path))[0]
-            
-            return {"title": title, "content": text, "format": "pdf"}
-    except Exception as e:
-        return {"title": os.path.basename(file_path), "content": "", "format": "pdf", "error": str(e)}
-
-def read_epub(file_path):
-    try:
-        book = epub.read_epub(file_path)
-        text = ""
-        
-        title = "Неизвестно"
-        if book.get_metadata('DC', 'title'):
-            title = book.get_metadata('DC', 'title')[0][0]
-        
-        for item in book.get_items():
-            if item.get_type() == 9:
-                soup = BeautifulSoup(item.get_content(), 'html.parser')
-                for script in soup(["script", "style"]):
-                    script.decompose()
-                text += soup.get_text() + "\n\n"
-        
-        return {"title": title, "content": text, "format": "epub"}
-    except Exception as e:
-        return {"title": os.path.basename(file_path), "content": "", "format": "epub", "error": str(e)}
-
-def process_file(file_path):
-    if not os.path.exists(file_path):
-        return {"error": "Файл не найден"}
-    
+def extract_text(file_path):
     ext = os.path.splitext(file_path)[1].lower()
-    
-    readers = {
-        '.txt': read_txt,
-        '.fb2': read_fb2,
-        '.pdf': read_pdf,
-        '.epub': read_epub
-    }
-    
-    reader = readers.get(ext)
-    
-    if not reader:
-        return {
-            "title": os.path.basename(file_path), 
-            "content": "", 
-            "format": ext, 
-            "error": f"Неподдерживаемый формат: {ext}"
-        }
-    
-    book_data = reader(file_path)
-  
-    return book_data
+    try:
+        if ext == '.txt':
+            with open(file_path, 'rb') as f:
+                raw = f.read()
+                enc = chardet.detect(raw)['encoding'] or 'utf-8'
+            with open(file_path, 'r', encoding=enc, errors='ignore') as f:
+                return f.read(), os.path.splitext(os.path.basename(file_path))[0]
+        
+        elif ext == '.fb2':
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                soup = BeautifulSoup(f.read(), 'xml')
+            title = soup.find('book-title').get_text() if soup.find('book-title') else "FB2 Book"
+            text = "\n\n".join([p.get_text() for p in soup.find_all('p')])
+            return text, title
+            
+        elif ext == '.pdf':
+            with open(file_path, 'rb') as f:
+                reader = PyPDF2.PdfReader(f)
+                text = "".join([p.extract_text() or "" for p in reader.pages])
+                title = reader.metadata.get('/Title') or os.path.basename(file_path)
+            return text, title
+            
+        elif ext == '.epub':
+            book = epub.read_epub(file_path)
+            title = book.get_metadata('DC', 'title')[0][0] if book.get_metadata('DC', 'title') else "EPUB"
+            text = ""
+            for item in book.get_items_of_type(9):
+                text += BeautifulSoup(item.get_content(), 'html.parser').get_text() + "\n"
+            return text, title
+    except:
+        return None, None
+    return None, None
