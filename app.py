@@ -1,6 +1,7 @@
 import streamlit as st
 import os
 import uuid
+import time
 from converter import process_file
 from search_engine import add_to_index, search_semantic, load_index
 
@@ -9,6 +10,7 @@ st.title("📚 Novellect: Прототип №2")
 st.markdown("Локальная библиотека книг с семантическим поиском.")
 
 UPLOAD_DIR = "uploads"
+
 if not os.path.exists(UPLOAD_DIR):
     os.makedirs(UPLOAD_DIR)
 
@@ -89,9 +91,11 @@ st.header("🔍 Поиск по библиотеке")
 query = st.text_input("Введите поисковый запрос:", placeholder="Например: искусственный интеллект...")
 
 if query:
+    start_time = time.time()
     with st.spinner("Поиск..."):
         results = search_semantic(query, top_k=3)
-    
+    end_time = time.time()
+    st.write(f"⏱️ Время выполения: {(end_time - start_time):.3f} сек")
     if not results:
         st.info("😕 Ничего не найдено. Попробуйте изменить запрос.")
     else:
@@ -101,4 +105,4 @@ if query:
                 st.caption("Фрагмент текста с наибольшим совпадением")
 
 st.markdown("---")
-st.caption("Novellect Prototype 2 | Февраль 2024 | Семантический поиск по книгам")
+st.caption("Novellect Prototype 2 | Февраль 2026 | Семантический поиск по книгам")
