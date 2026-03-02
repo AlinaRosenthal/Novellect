@@ -6,3 +6,4 @@ ebooklib
 sentence-transformers
 scikit-learn
 numpy
+rank_bm25
