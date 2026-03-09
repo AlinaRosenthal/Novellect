@@ -1,5 +1,4 @@
-uploads/
 __pycache__/
-storage.json
-vector_db.npz
-/books
+data/
+books/
+uploads/

@@ -1,172 +1,460 @@
+from __future__ import annotations
+
+import importlib
 import json
-import os
+import math
 import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
 import numpy as np
-import time
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
-from rank_bm25 import BM25Okapi
 
-STORAGE_FILE = 'storage.json'
-VECTOR_DB_FILE = 'vector_db.npz'
+import storage
 
-STOP_WORDS = {
-    'про', 'книга', 'книгу', 'книги', 'автор', 'сюжет', 'прочитать', 'найти',
-    'и', 'в', 'во', 'не', 'что', 'он', 'на', 'я', 'с', 'со', 'как', 'а', 'то', 
-    'все', 'она', 'так', 'из', 'за', 'вы', 'же', 'бы', 'по', 'только', 'ее', 
-    'мне', 'было', 'вот', 'от', 'меня', 'еще', 'о', 'из', 'ему', 'теперь', 'когда',
-    'быть', 'был', 'была', 'это', 'для', 'кто', 'дом', 'год', 'купить', 'читать'
+BASE_DIR = Path(__file__).resolve().parent
+VECTOR_STORE_FILE = BASE_DIR / "data" / "vector_store.npz"
+TOKEN_RE = re.compile(r"[a-zA-Zа-яА-ЯёЁ0-9]+")
+SPACE_RE = re.compile(r"\s+")
+
+
+@dataclass
+class EmbeddingBackend:
+    name: str
+    model_name: str
+    dim: Optional[int]
+
+    def encode(self, texts: Sequence[str]) -> np.ndarray:
+        raise NotImplementedError
+
+
+class SentenceTransformerBackend(EmbeddingBackend):
+    def __init__(self, model_name: str = "paraphrase-multilingual-MiniLM-L12-v2") -> None:
+        self._model = None
+        super().__init__(name="sentence-transformers", model_name=model_name, dim=384)
+
+    def _ensure_model(self):
+        if self._model is None:
+            from sentence_transformers import SentenceTransformer
+
+            self._model = SentenceTransformer(self.model_name)
+        return self._model
+
+    def encode(self, texts: Sequence[str]) -> np.ndarray:
+        model = self._ensure_model()
+        vectors = model.encode(list(texts), show_progress_bar=False, convert_to_numpy=True)
+        return np.asarray(vectors, dtype=np.float32)
+
+
+_BACKEND: Optional[EmbeddingBackend] = None
+_BACKEND_ERROR: Optional[str] = None
+
+
+def get_embedding_backend() -> Optional[EmbeddingBackend]:
+    global _BACKEND, _BACKEND_ERROR
+    if _BACKEND is not None:
+        return _BACKEND
+    if _BACKEND_ERROR is not None:
+        return None
+    try:
+        importlib.import_module('sentence_transformers')
+        _BACKEND = SentenceTransformerBackend()
+        return _BACKEND
+    except Exception as exc:  # pragma: no cover - optional dependency path
+        _BACKEND_ERROR = str(exc)
+        return None
+
+
+def get_embedding_backend_status() -> Dict[str, Any]:
+    backend = get_embedding_backend()
+    return {
+        "available": backend is not None,
+        "backend": backend.name if backend else "disabled",
+        "model_name": backend.model_name if backend else None,
+        "error": _BACKEND_ERROR,
+    }
+
+
+def normalize_for_search(text: str) -> str:
+    text = (text or "").lower().replace("ё", "е")
+    text = SPACE_RE.sub(" ", text)
+    return text.strip()
+
+
+RUSSIAN_SUFFIXES = [
+    "иями", "ями", "ами", "иях", "ях", "ов", "ев", "ом", "ем", "ам", "ям", "ах", "ях",
+    "ия", "ья", "ие", "ье", "ий", "ый", "ой", "ая", "яя", "ое", "ее", "ые", "ие",
+    "ов", "ев", "ы", "и", "а", "я", "у", "ю", "е", "о",
+]
+
+
+def normalize_token(token: str) -> str:
+    token = token.lower().replace("ё", "е")
+    for suffix in RUSSIAN_SUFFIXES:
+        if len(token) > len(suffix) + 2 and token.endswith(suffix):
+            return token[: -len(suffix)]
+    return token
+
+
+def tokenize(text: str) -> List[str]:
+    return [normalize_token(token) for token in TOKEN_RE.findall(text or "")]
+
+
+STOPWORDS = {
+    "и",
+    "в",
+    "во",
+    "на",
+    "с",
+    "со",
+    "по",
+    "под",
+    "над",
+    "не",
+    "что",
+    "как",
+    "к",
+    "ко",
+    "из",
+    "за",
+    "у",
+    "о",
+    "об",
+    "про",
+    "для",
+    "или",
+    "где",
+    "когда",
+    "кто",
+    "это",
+    "эта",
+    "этот",
+    "хочу",
+    "хоч",
+    "книгу",
+    "книга",
+    "книг",
+    "почитать",
+    "почит",
+    "найди",
+    "найд",
+    "подбери",
+    "подбер",
+    "посоветуй",
+    "посовет",
 }
 
-_model_cache = None
 
-def get_model():
-    global _model_cache
-    if _model_cache is None:
-        print("[INIT] Загрузка модели SentenceTransformer...")
-        _model_cache = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
-    return _model_cache
+def informative_tokens(text: str) -> List[str]:
+    return [token for token in tokenize(text) if len(token) > 2 and token not in STOPWORDS]
 
-def load_index():
-    if not os.path.exists(STORAGE_FILE): 
-        return []
-    with open(STORAGE_FILE, 'r', encoding='utf-8') as f:
-        return json.load(f)
 
-def save_index(index):
-    with open(STORAGE_FILE, 'w', encoding='utf-8') as f:
-        json.dump(index, f, ensure_ascii=False, indent=2)
 
-def tokenize_smart(text):
-    words = re.findall(r'\w+', text.lower())
-    return [w for w in words if w not in STOP_WORDS and len(w) > 1]
-
-def split_text_semantic(text, threshold=0.3):
-    print("[PROCESS] Семантическое разбиение текста...")
-    model = get_model()
-    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
-    sentences = [s.strip() for s in sentences if s.strip()]
-    if len(sentences) < 2: return sentences
-    
-    embeddings = model.encode(sentences, show_progress_bar=False)
-    chunks, current_chunk = [], [sentences[0]]
-    for i in range(len(sentences) - 1):
-        sim = cosine_similarity([embeddings[i]], [embeddings[i+1]])[0][0]
-        if sim > threshold:
-            current_chunk.append(sentences[i+1])
-        else:
-            chunks.append(" ".join(current_chunk))
-            current_chunk = [sentences[i+1]]
-    if current_chunk: chunks.append(" ".join(current_chunk))
-    print(f"[INFO] Текст разбит на {len(chunks)} чанков.")
-    return chunks
-
-def load_vector_db():
-    if not os.path.exists(VECTOR_DB_FILE): return None, None
+def load_vector_store() -> Tuple[Optional[np.ndarray], List[int], Optional[str]]:
+    if not VECTOR_STORE_FILE.exists():
+        return None, [], None
     try:
-        data = np.load(VECTOR_DB_FILE, allow_pickle=True)
-        embeddings = data['embeddings']
-        metadata = json.loads(data['metadata'].item()) if data['metadata'].size > 0 else []
-        return embeddings, metadata
-    except: return None, None
+        payload = np.load(VECTOR_STORE_FILE, allow_pickle=True)
+        vectors = payload["vectors"]
+        chunk_ids = payload["chunk_ids"].astype(np.int64).tolist()
+        backend_name = None
+        if "backend_name" in payload:
+            backend_name = str(payload["backend_name"].item())
+        return np.asarray(vectors, dtype=np.float32), chunk_ids, backend_name
+    except Exception:
+        return None, [], None
 
-def add_to_index(book_data, file_id):
-    title = book_data.get('title', 'Без названия')
-    print(f"[START] Добавление книги в индекс: {title}")
-    
-    index = load_index()
-    index = [b for b in index if b['id'] != file_id]
-    model = get_model()
-    
-    content = book_data.get('content', "")
-    chunks = book_data.get('chunks') or split_text_semantic(content)
-    if not chunks: 
-        print("[ERROR] Не удалось создать чанки.")
-        return None
-    
-    print(f"[PROCESS] Генерация эмбеддингов для {len(chunks)} чанков...")
-    new_embeddings = model.encode(chunks, show_progress_bar=True)
-    
-    print("[PROCESS] Обновление векторной базы данных...")
-    old_embeddings, old_metadata = load_vector_db()
-    
-    new_meta = [{
-        "book_id": file_id,
-        "book_title": title,
-        "format": book_data.get('format', 'unknown'),
-        "chunk": c
-    } for c in chunks]
-    
-    if old_embeddings is not None and len(old_embeddings) > 0:
-        mask = [m.get('book_id') != file_id for m in (old_metadata or [])]
-        old_embeddings_filtered = old_embeddings[mask]
-        old_metadata_filtered = [m for i, m in enumerate(old_metadata or []) if mask[i]]
-        combined_embeddings = np.vstack([old_embeddings_filtered, new_embeddings]) if len(old_embeddings_filtered) > 0 else new_embeddings
-        final_metadata = old_metadata_filtered + new_meta
-    else:
-        combined_embeddings, final_metadata = new_embeddings, new_meta
-    
-    np.savez(VECTOR_DB_FILE, embeddings=combined_embeddings, metadata=json.dumps(final_metadata))
-    
-    record = {
-        "id": file_id, 
-        "title": title, 
-        "format": book_data.get('format', 'unknown'),
-        "chunks_count": len(chunks)
+
+
+def save_vector_store(vectors: np.ndarray, chunk_ids: Sequence[int], backend_name: str) -> None:
+    storage.ensure_data_dirs()
+    np.savez_compressed(
+        VECTOR_STORE_FILE,
+        vectors=np.asarray(vectors, dtype=np.float32),
+        chunk_ids=np.asarray(list(chunk_ids), dtype=np.int64),
+        backend_name=np.array([backend_name], dtype=object),
+    )
+
+
+
+def clear_vector_store() -> None:
+    if VECTOR_STORE_FILE.exists():
+        VECTOR_STORE_FILE.unlink()
+
+
+
+def rebuild_vector_store() -> Dict[str, Any]:
+    chunks = storage.get_all_chunks()
+    if not chunks:
+        clear_vector_store()
+        return {
+            "indexed_chunks": 0,
+            "dense_available": False,
+            "backend": None,
+            "message": "Библиотека пуста.",
+        }
+
+    backend = get_embedding_backend()
+    if backend is None:
+        clear_vector_store()
+        return {
+            "indexed_chunks": len(chunks),
+            "dense_available": False,
+            "backend": None,
+            "message": "Dense-эмбеддинги не созданы: sentence-transformers недоступен.",
+        }
+
+    texts = [chunk["text"] for chunk in chunks]
+    try:
+        vectors = backend.encode(texts)
+    except Exception as exc:
+        clear_vector_store()
+        return {
+            "indexed_chunks": len(chunks),
+            "dense_available": False,
+            "backend": None,
+            "message": f"Dense-эмбеддинги не созданы: {exc}",
+        }
+    chunk_ids = [int(chunk["chunk_id"]) for chunk in chunks]
+    save_vector_store(vectors, chunk_ids, backend.name)
+    return {
+        "indexed_chunks": len(chunks),
+        "dense_available": True,
+        "backend": backend.name,
+        "message": f"Индекс обновлен: {len(chunks)} чанков.",
     }
-    index.append(record)
-    save_index(index)
-    print(f"[SUCCESS] Книга '{title}' успешно проиндексирована.")
-    return record
 
-class HybridSearch:
-    def __init__(self):
-        self.bm25 = None
-        self.corpus_id = None
 
-    def search(self, query, model, embeddings, metadata, top_k=5, alpha=0.7):
-        print(f"[SEARCH] Запрос: '{query}'")
-        
-        start_time = time.time()
-        q_emb = model.encode([query], show_progress_bar=False)
-        sem_scores = cosine_similarity(q_emb, embeddings)[0]
-        
-        tokenized_query = tokenize_smart(query)
-        current_corpus_id = hash(str(metadata))
-        
-        if self.bm25 is None or self.corpus_id != current_corpus_id:
-            print("[SEARCH] Обновление индекса BM25...")
-            corpus = [tokenize_smart(m.get('chunk', '')) for m in metadata]
-            self.bm25 = BM25Okapi(corpus)
-            self.corpus_id = current_corpus_id
-        
-        bm25_raw = self.bm25.get_scores(tokenized_query)
-        max_b = np.max(bm25_raw)
-        bm25_norm = bm25_raw / max_b if max_b > 0 else bm25_raw
 
-        combined = (alpha * sem_scores) + ((1 - alpha) * bm25_norm)
-        top_indices = np.argsort(combined)[-top_k:][::-1]
-        
-        duration = time.time() - start_time
-        print(f"[SEARCH] Поиск завершен за {duration:.3f} сек.")
-        
-        results = []
-        for idx in top_indices:
-            results.append({
-                "title": metadata[idx].get('book_title', 'Без названия'),
-                "format": metadata[idx].get('format', 'unknown'),
-                "snippet": metadata[idx].get('chunk', '')[:400] + "...",
-                "similarity": float(combined[idx]),
-                "sem_score": float(sem_scores[idx]),
-                "bm25_score": float(bm25_norm[idx])
-            })
-        return results
+def cosine_scores(query_vector: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    if matrix.size == 0:
+        return np.array([], dtype=np.float32)
+    query_norm = np.linalg.norm(query_vector)
+    matrix_norm = np.linalg.norm(matrix, axis=1)
+    denom = np.clip(matrix_norm * query_norm, 1e-8, None)
+    scores = (matrix @ query_vector) / denom
+    return scores.astype(np.float32)
 
-_engine = HybridSearch()
 
-def search_hybrid(query, top_k=5, alpha=0.7):
-    emb, meta = load_vector_db()
-    if emb is None or not meta: 
-        print("[WARNING] База данных пуста.")
-        return []
-    return _engine.search(query, get_model(), emb, meta, top_k, alpha)
+
+def build_df(chunks: Sequence[Dict[str, Any]]) -> Dict[str, int]:
+    df: Dict[str, int] = {}
+    for chunk in chunks:
+        unique_tokens = set(informative_tokens(chunk["text"]))
+        for token in unique_tokens:
+            df[token] = df.get(token, 0) + 1
+    return df
+
+
+
+def keyword_score(query_tokens: Sequence[str], text_tokens: Sequence[str], df: Dict[str, int], total_docs: int) -> float:
+    if not query_tokens or not text_tokens:
+        return 0.0
+    token_set = set(text_tokens)
+    score = 0.0
+    max_score = 0.0
+    for token in query_tokens:
+        inv_df = math.log((1 + total_docs) / (1 + df.get(token, 0))) + 1.0
+        max_score += inv_df
+        if token in token_set:
+            score += inv_df
+    if max_score == 0:
+        return 0.0
+    return min(score / max_score, 1.0)
+
+
+
+def exact_phrase_bonus(query_text: str, chunk_text: str) -> float:
+    normalized_query = normalize_for_search(query_text)
+    normalized_chunk = normalize_for_search(chunk_text)
+    if not normalized_query or len(normalized_query) < 3:
+        return 0.0
+    if normalized_query in normalized_chunk:
+        return 1.0
+    return 0.0
+
+
+
+def quoted_phrase(query: str) -> Optional[str]:
+    match = re.search(r"[\"“”«](.+?)[\"“”»]", query)
+    return match.group(1).strip() if match else None
+
+
+
+def _dense_score_map(query_text: str) -> Tuple[Dict[int, float], bool]:
+    backend = get_embedding_backend()
+    if backend is None:
+        return {}, False
+
+    vectors, chunk_ids, backend_name = load_vector_store()
+    if vectors is None or not chunk_ids:
+        return {}, False
+    if backend_name and backend_name != backend.name:
+        return {}, False
+
+    try:
+        query_vector = backend.encode([query_text])[0]
+    except Exception:
+        return {}, False
+    scores = cosine_scores(query_vector, vectors)
+    return {int(chunk_id): float(score) for chunk_id, score in zip(chunk_ids, scores)}, True
+
+
+
+def _combine_scores(
+    *,
+    dense: float,
+    keyword: float,
+    phrase: float,
+    intent: str,
+) -> float:
+    if intent == "exact_quote":
+        return min(1.0, 0.7 * phrase + 0.2 * keyword + 0.1 * max(dense, 0.0))
+    if intent == "discovery":
+        return 0.45 * max(dense, 0.0) + 0.45 * keyword + 0.10 * phrase
+    if intent == "complex":
+        return 0.50 * max(dense, 0.0) + 0.35 * keyword + 0.15 * phrase
+    return 0.55 * max(dense, 0.0) + 0.35 * keyword + 0.10 * phrase
+
+
+
+def _chunk_matches_constraint(chunk_text: str, constraints: Sequence[str]) -> float:
+    if not constraints:
+        return 0.0
+    normalized = normalize_for_search(chunk_text)
+    matched = 0
+    for constraint in constraints:
+        if normalize_for_search(constraint) in normalized:
+            matched += 1
+    return matched / max(len(constraints), 1)
+
+
+
+def hybrid_search(plan: Dict[str, Any], top_k: int = 8) -> Dict[str, Any]:
+    query_text = plan.get("search_query") or plan.get("original_query") or ""
+    intent = plan.get("intent", "semantic_lookup")
+    chunks = storage.get_all_chunks()
+    if not chunks:
+        return {
+            "query": query_text,
+            "intent": intent,
+            "dense_available": False,
+            "chunk_results": [],
+            "book_results": [],
+        }
+
+    q_phrase = plan.get("quoted_phrase") or quoted_phrase(query_text)
+    keyword_tokens = plan.get("keywords") or informative_tokens(query_text)
+    constraints = plan.get("constraints") or []
+    total_docs = max(len(chunks), 1)
+    df = build_df(chunks)
+    dense_map, dense_available = _dense_score_map(query_text)
+
+    chunk_results: List[Dict[str, Any]] = []
+    for chunk in chunks:
+        text = chunk["text"]
+        phrase_score = exact_phrase_bonus(q_phrase or query_text, text) if (q_phrase or query_text) else 0.0
+        key_score = keyword_score(keyword_tokens, informative_tokens(text), df, total_docs)
+        dense_score = dense_map.get(int(chunk["chunk_id"]), 0.0)
+        constraint_score = _chunk_matches_constraint(text, constraints)
+        combined = _combine_scores(
+            dense=dense_score,
+            keyword=key_score,
+            phrase=max(phrase_score, constraint_score),
+            intent=intent,
+        )
+        if intent == "complex" and constraints:
+            combined = 0.75 * combined + 0.25 * constraint_score
+        chunk_results.append(
+            {
+                **chunk,
+                "dense_score": float(dense_score),
+                "keyword_score": float(key_score),
+                "phrase_score": float(phrase_score),
+                "constraint_score": float(constraint_score),
+                "score": float(combined),
+            }
+        )
+
+    min_threshold = 0.16 if intent in {"semantic_lookup", "complex"} else 0.12
+    if intent == "exact_quote":
+        min_threshold = 0.10
+
+    chunk_results = [item for item in chunk_results if item["score"] >= min_threshold or item["phrase_score"] > 0]
+    chunk_results.sort(
+        key=lambda item: (
+            item["score"],
+            item["phrase_score"],
+            item["keyword_score"],
+            item["dense_score"],
+        ),
+        reverse=True,
+    )
+
+    deduped_chunks: List[Dict[str, Any]] = []
+    seen_texts = set()
+    for item in chunk_results:
+        normalized_text = normalize_for_search(item["text"][:300])
+        if normalized_text in seen_texts:
+            continue
+        deduped_chunks.append(item)
+        seen_texts.add(normalized_text)
+        if len(deduped_chunks) >= max(top_k * 3, top_k):
+            break
+
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for item in deduped_chunks:
+        book_id = item["book_id"]
+        current = grouped.setdefault(
+            book_id,
+            {
+                "book_id": book_id,
+                "title": item["title"],
+                "author": item.get("author"),
+                "format": item.get("format"),
+                "score": item["score"],
+                "best_chunks": [],
+                "last_opened_at": item.get("last_opened_at"),
+                "open_count": int(item.get("open_count") or 0),
+                "added_at": item.get("added_at"),
+            },
+        )
+        current["score"] = max(current["score"], item["score"])
+        if len(current["best_chunks"]) < 3:
+            current["best_chunks"].append(item)
+
+    book_results = list(grouped.values())
+    if intent == "discovery":
+        book_results.sort(
+            key=lambda item: (
+                item["last_opened_at"] is not None,
+                item["last_opened_at"] or "",
+                -item["score"],
+                item["title"].lower(),
+            )
+        )
+    else:
+        book_results.sort(key=lambda item: (item["score"], item["title"].lower()), reverse=True)
+
+    return {
+        "query": query_text,
+        "intent": intent,
+        "dense_available": dense_available,
+        "chunk_results": deduped_chunks[: max(top_k, 5)],
+        "book_results": book_results[:top_k],
+    }
+
+
+
+def vector_store_file_size_mb() -> float:
+    if not VECTOR_STORE_FILE.exists():
+        return 0.0
+    return round(VECTOR_STORE_FILE.stat().st_size / (1024 * 1024), 3)
+
+
+
+def estimate_dense_ram_mb() -> float:
+    vectors, _, _ = load_vector_store()
+    if vectors is None:
+        return 0.0
+    return round(vectors.nbytes / (1024 * 1024), 3)
