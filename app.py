@@ -5,7 +5,6 @@ import time
 from converter import process_file
 from search_engine import add_to_index, load_index, clear_cache
 from agents import AgentOrchestrator
-from fine_tune import fine_tune_model
 import pandas as pd
 from datetime import datetime
 
@@ -131,23 +130,6 @@ with st.sidebar:
                 status_text.text(f"✅ Готово! Всего: {total_elapsed:.1f} сек")
                 time.sleep(1.5)
                 st.rerun()
-
-    # Дообучение модели
-    with st.expander("🧠 Дообучение модели", expanded=False):
-        st.markdown("""
-        Дообучите модель на ваших книгах для лучшего понимания литературных контекстов.
-        """)
-
-        if st.button("🚀 Запустить дообучение", use_container_width=True):
-            with st.spinner("Дообучение модели... Это может занять несколько минут"):
-                try:
-                    success = fine_tune_model(epochs=1, batch_size=2)
-                    if success:
-                        st.success("✅ Модель успешно дообучена!")
-                    else:
-                        st.error("❌ Ошибка дообучения. Нужно больше книг в библиотеке.")
-                except Exception as e:
-                    st.error(f"❌ Ошибка: {e}")
 
     # Очистка
     col1, col2 = st.columns(2)
