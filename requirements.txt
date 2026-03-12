@@ -1,5 +1,7 @@
 streamlit
+pandas
 beautifulsoup4
+lxml
 chardet
 PyPDF2
 ebooklib
@@ -7,3 +9,4 @@ sentence-transformers
 scikit-learn
 numpy
 rank_bm25
+requests

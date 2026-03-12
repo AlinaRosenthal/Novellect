@@ -1,13 +1,11 @@
-import os
-import xml.etree.ElementTree as ET
-from bs4 import BeautifulSoup
-import chardet
-import PyPDF2
-from ebooklib import epub
-import re
 import hashlib
+import os
 import pickle
-from pathlib import Path
+import re
+import PyPDF2
+import chardet
+from bs4 import BeautifulSoup
+from ebooklib import epub
 
 # Папка для кэша txt-версий
 TXT_CACHE_DIR = "txt_cache"
@@ -264,6 +262,10 @@ def process_file(file_path):
 
     if 'from_cache' in book_data:
         print(f"[INFO] Загружено из кэша: {file_path}")
+
+    content = book_data.get("content", "")
+    if not content or len(content.strip()) < 10:
+        return {"error": "Файл пуст или содержит нечитаемый текст. Загрузка отклонена."}
 
     return book_data
 

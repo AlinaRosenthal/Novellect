@@ -1,8 +1,7 @@
 import re
 from datetime import datetime
-import numpy as np
-from search_engine import search_hybrid, load_index, update_last_opened
 from search_engine import get_query_analyzer, get_text_analyzer
+from search_engine import search_hybrid, load_index, update_last_opened
 
 # Глобальные анализаторы
 _query_analyzer = get_query_analyzer()

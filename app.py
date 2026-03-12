@@ -1,12 +1,15 @@
-import streamlit as st
 import os
-import uuid
 import time
-from converter import process_file
-from search_engine import add_to_index, load_index, clear_cache
-from agents import AgentOrchestrator
 import pandas as pd
+import uuid
+import streamlit as st
+import storage
+from agents import AgentOrchestrator
+from converter import process_file
+from search_engine import add_to_index, clear_cache
+import hashlib
 from datetime import datetime
+
 
 st.set_page_config(page_title="Novellect Agent System", page_icon="🤖", layout="wide")
 st.title("🤖 Novellect: Мультиагентная система поиска книг")
@@ -15,20 +18,27 @@ st.markdown("Локальная библиотека книг с интелле�
 UPLOAD_DIR = "uploads"
 TXT_CACHE_DIR = "txt_cache"
 
+# Создаем папки
 for dir_path in [UPLOAD_DIR, TXT_CACHE_DIR]:
     if not os.path.exists(dir_path):
         os.makedirs(dir_path)
 
-# Инициализация оркестратора в сессии
 if 'orchestrator' not in st.session_state:
     st.session_state.orchestrator = AgentOrchestrator()
 
-# Боковая панель
+# --- БОКОВАЯ ПАНЕЛЬ ---
 with st.sidebar:
     st.header("📊 Состояние системы")
 
-    # Статистика
-    index = load_index()
+    # 1. КОНТРОЛЬ ЛИМИТА 1 ГБ
+    size_mb = storage.get_library_size() / (1024 * 1024)
+    st.progress(min(size_mb / 1024, 1.0))
+    st.caption(f"Занято: {size_mb:.2f} МБ из 1024 МБ (1 ГБ)")
+    if size_mb > 900:
+        st.warning("⚠️ Память почти заполнена!")
+
+    # 2. СТАТИСТИКА
+    index = storage.load_index()
     col1, col2 = st.columns(2)
     with col1:
         st.metric("Всего книг", len(index))
@@ -36,49 +46,10 @@ with st.sidebar:
         total_chunks = sum(book.get('chunks_count', 0) for book in index)
         st.metric("Всего чанков", total_chunks)
 
-    # Информация об агентах
-    with st.expander("🤖 Активные агенты", expanded=True):
-        st.markdown("""
-        - **QueryAnalyzerAgent**: Анализ запросов
-        - **RetrievalAgent**: Поиск по RAG
-        - **RankingAgent**: Ранжирование результатов
-        - **ResponseAgent**: Форматирование ответов
-        """)
-
-    # Информация о кэше txt
-    with st.expander("💾 Кэш TXT-версий"):
-        if os.path.exists(TXT_CACHE_DIR):
-            cache_files = os.listdir(TXT_CACHE_DIR)
-            txt_files = [f for f in cache_files if f.endswith('.txt')]
-
-            st.metric("Кэшированные книги", len(txt_files))
-
-            # Размер кэша
-            total_size = 0
-            for f in cache_files:
-                f_path = os.path.join(TXT_CACHE_DIR, f)
-                if os.path.isfile(f_path):
-                    total_size += os.path.getsize(f_path)
-
-            st.metric("Размер кэша", f"{total_size / 1024 / 1024:.1f} MB")
-
-            if st.button("🧹 Очистить кэш", use_container_width=True):
-                for f in os.listdir(TXT_CACHE_DIR):
-                    try:
-                        os.remove(os.path.join(TXT_CACHE_DIR, f))
-                    except:
-                        pass
-                st.success("Кэш очищен")
-                time.sleep(1)
-                st.rerun()
-        else:
-            st.write("Кэш пуст")
-
-    # Управление
     st.header("🛠 Управление")
 
-    # Загрузка книг
-    with st.expander("📤 Загрузить книги", expanded=False):
+    # 3. ЗАГРУЗКА КНИГ (Deduplication + 1GB Limit)
+    with st.expander("📤 Загрузить книги", expanded=True):
         uploaded_files = st.file_uploader(
             "Выберите файлы (.txt, .fb2, .pdf, .epub)",
             type=['txt', 'fb2', 'pdf', 'epub'],
@@ -86,241 +57,194 @@ with st.sidebar:
         )
 
         if uploaded_files and st.button("🚀 Начать индексацию", use_container_width=True):
-            index = load_index()
-            existing_titles = [book.get('title', '') for book in index]
-            files_to_process = []
+            progress_bar = st.progress(0)
+            status_text = st.empty()
 
-            for f in uploaded_files:
-                title = os.path.splitext(f.name)[0]
-                if title not in existing_titles:
-                    files_to_process.append(f)
+            for i, uploaded_file in enumerate(uploaded_files):
+                # 1. Читаем байты и считаем уникальный ХЕШ (SHA-256)
+                file_bytes = uploaded_file.getvalue()
+                file_hash = hashlib.sha256(file_bytes).hexdigest()
+
+                # 2. ПРОВЕРКА НА ДУБЛИКАТ (используем твою новую функцию из storage.py)
+                duplicate = storage.get_book_by_hash(file_hash)
+                if duplicate:
+                    st.warning(
+                        f"Пропуск: книга '{uploaded_file.name}' уже есть в библиотеке (как '{duplicate['title']}')")
+                    progress_bar.progress((i + 1) / len(uploaded_files))
+                    continue
+
+                # 3. ПРОВЕРКА ЛИМИТА 1 ГБ
+                if storage.is_limit_exceeded(uploaded_file.size):
+                    st.error(f"Лимит 1 ГБ превышен! Файл {uploaded_file.name} пропущен.")
+                    progress_bar.progress((i + 1) / len(uploaded_files))
+                    continue
+
+                # 4. Сохранение файла на диск
+                status_text.text(f"Обработка: {uploaded_file.name}")
+                file_id = str(uuid.uuid4())
+                file_path = os.path.join(UPLOAD_DIR, f"{file_id}_{uploaded_file.name}")
+
+                with open(file_path, "wb") as f:
+                    f.write(file_bytes)
+
+                # 5. Конвертация (извлечение текста)
+                book_data = process_file(file_path)
+
+                # Проверка на пустой или битый файл (уже внутри process_file)
+                if book_data.get('error'):
+                    st.error(f"Ошибка в {uploaded_file.name}: {book_data['error']}")
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
                 else:
-                    st.warning(f"Пропуск: {f.name} уже в базе")
+                    # ВАЖНО: Добавляем хеш в данные книги перед индексацией
+                    book_data['file_hash'] = file_hash
 
-            if files_to_process:
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                time_text = st.empty()
+                    # 6. Индексация (генерация векторов и запись в JSON)
+                    add_to_index(book_data, file_id)
 
-                start_total = time.time()
+                progress_bar.progress((i + 1) / len(uploaded_files))
 
-                for i, uploaded_file in enumerate(files_to_process):
-                    status_text.text(f"Обработка: {uploaded_file.name}")
-
-                    file_id = str(uuid.uuid4())
-                    file_path = os.path.join(UPLOAD_DIR, f"{file_id}_{uploaded_file.name}")
-
-                    with open(file_path, "wb") as f:
-                        f.write(uploaded_file.getbuffer())
-
-                    # Засекаем время на книгу
-                    start_book = time.time()
-                    book_data = process_file(file_path)
-
-                    if not book_data.get('error'):
-                        record = add_to_index(book_data, file_id)
-                        elapsed_book = time.time() - start_book
-                        time_text.text(f"⏱ Книга {i + 1}/{len(files_to_process)}: {elapsed_book:.1f} сек")
-                    else:
-                        st.error(f"Ошибка в {uploaded_file.name}: {book_data['error']}")
-
-                    progress_bar.progress((i + 1) / len(files_to_process))
-
-                total_elapsed = time.time() - start_total
-                status_text.text(f"✅ Готово! Всего: {total_elapsed:.1f} сек")
-                time.sleep(1.5)
-                st.rerun()
-
-    # Очистка
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("🗑 Очистить кэш поиска", use_container_width=True):
-            clear_cache()
-            st.success("Кэш поиска очищен")
-
-    with col2:
-        if st.button("🗑 Очистить всё", use_container_width=True):
-            for f in ['storage.json', 'vector_db.npz', 'search_cache.pkl']:
-                if os.path.exists(f):
-                    try:
-                        os.remove(f)
-                    except:
-                        pass
-            st.success("Все данные очищены")
+            st.success("Индексация успешно завершена!")
             time.sleep(1)
             st.rerun()
 
-    # Список книг
+    # 4. ОЧИСТКА
+    st.markdown("---")
+    col_c1, col_c2 = st.columns(2)
+    with col_c1:
+        if st.button("🗑 Кэш поиска", use_container_width=True):
+            clear_cache()  # Тот самый вызов
+            st.success("Очищено")
+    with col_c2:
+        if st.button("🗑 Очистить всё", use_container_width=True):
+            # 1. Физическое удаление файлов
+            for f in ['storage.json', 'vector_db.npz', 'search_cache.pkl']:
+                if os.path.exists(f): os.remove(f)
+
+            # 2. Очистка папок
+            for folder in [UPLOAD_DIR, TXT_CACHE_DIR]:
+                if os.path.exists(folder):
+                    for file in os.listdir(folder):
+                        os.remove(os.path.join(folder, file))
+
+            # 3. КРИТИЧЕСКИ ВАЖНО: Очистка памяти Streamlit
+            st.session_state.clear()
+
+            st.success("Система полностью обнулена")
+            st.rerun()
+
+    # 5. БИБЛИОТЕКА
     with st.expander("📚 Библиотека"):
         if index:
-            # Безопасная сортировка по last_opened
-            def get_sort_key(book):
-                last = book.get('last_opened')
-                return last if last is not None else 0
-
-
-            sorted_books = sorted(index, key=get_sort_key, reverse=True)
+            # Сортировка: сначала те, что открывались давно (по ТЗ)
+            sorted_books = sorted(index, key=lambda x: x.get('last_opened') or 0)
 
             for book in sorted_books:
                 title = book.get('title', 'Без названия')
                 last = book.get('last_opened')
-                last_str = datetime.fromtimestamp(last).strftime('%d.%m.%Y') if last else 'никогда'
-                opens = book.get('open_count', 0)
+                last_str = datetime.fromtimestamp(last).strftime('%d.%m %H:%M') if last else 'никогда'
 
-                # ========== НОВОЕ: Показываем настроение книги ==========
-                mood_info = ""
-                if 'mood' in book:
-                    top_moods = sorted(book['mood'].items(), key=lambda x: x[1], reverse=True)[:2]
-                    top_moods = [f"{m}: {s:.0%}" for m, s in top_moods if s > 0.1]
-                    if top_moods:
-                        mood_info = f" | {', '.join(top_moods)}"
+                # Отображаем информацию о книге
+                st.write(f"**{title}**")
+                st.caption(f"📅 Открыто: {last_str}")
 
-                st.write(f"• {title} ({opens} откр, посл: {last_str}){mood_info}")
+                # Кнопка удаления для конкретной книги
+                # Используем уникальный ключ del_ + id книги, чтобы кнопки не конфликтовали
+                if st.button(f"🗑 Удалить", key=f"del_{book['id']}", use_container_width=True):
+                    storage.delete_book_physically(book['id'])  # Удаляем физически и из индекса
+                    st.success(f"Удалено: {title}")
+                    time.sleep(0.5)  # Даем пользователю увидеть сообщение
+                    st.rerun()  # Перезагружаем интерфейс, чтобы обновить список и индикатор памяти
+
+                st.markdown("---")  # Разделительная черта между книгами
         else:
             st.write("Библиотека пуста")
 
-# Основная область - поиск
+# --- ПОИСК ---
 st.header("🔍 Поиск по библиотеке")
 
-# История запросов в сессии
 if 'history' not in st.session_state:
     st.session_state.history = []
 
-# Форма поиска
 with st.form("search_form"):
-    query = st.text_input(
-        "Введите запрос:",
-        placeholder="Например: хочу прочитать про драконов или в какой книге главный герой - неймарек?",
-        key="query_input"
-    )
-
-    col1, col2, col3 = st.columns([2, 1, 1])
-    with col1:
-        use_agents = st.checkbox("🤖 Использовать агентов", value=True,
-                                 help="Агенты лучше обрабатывают сложные и неопределенные запросы")
-    with col2:
-        update_stats = st.checkbox("📊 Учитывать открытия", value=True)
-    with col3:
-        submitted = st.form_submit_button("🔍 Найти", use_container_width=True)
+    query = st.text_input("Введите запрос:", placeholder="Например: хочу прочитать про драконов...")
+    submitted = st.form_submit_button("🔍 Найти", use_container_width=True)
 
 if submitted and query:
     start_time = time.time()
-
-    with st.spinner("Агенты анализируют запрос..."):
+    with st.spinner("🤖 Группа агентов анализирует ваш запрос..."):
         try:
-            if use_agents:
-                # Используем мультиагентную систему
-                response = st.session_state.orchestrator.process_query(query, update_opened=update_stats)
-            else:
-                # Используем обычный поиск
-                from search_engine import search_hybrid
-
-                results = search_hybrid(query, top_k=5)
-                response = {
-                    'type': 'simple',
-                    'query': query,
-                    'results': [{'title': r.get('title', ''),
-                                 'snippet': r.get('snippet', ''),
-                                 'relevance': r.get('similarity', 0)}
-                                for r in results]
-                }
-
+            # 1. ЗАПУСК ОРКЕСТРАТОРА
+            response = st.session_state.orchestrator.process_query(query)
             elapsed = time.time() - start_time
 
-            # Сохраняем в историю
-            st.session_state.history.append({
-                'query': query,
-                'time': elapsed,
-                'type': response.get('type', 'simple')
-            })
+            # --- ВИЗУАЛИЗАЦИЯ РАБОТЫ АГЕНТОВ ---
+            st.markdown("### 🧠 Ход мыслей системы")
 
-            # Отображаем результаты
-            st.markdown(f"⏱️ Время выполнения: **{elapsed:.2f} сек**")
+            # Показываем работу первого агента (Analyzer)
+            with st.status("🕵️ QueryAnalyzerAgent закончил анализ", expanded=False):
+                st.write(f"**Тип запроса:** {response.get('type', 'определяется')}")
+                if 'genre' in response and response['genre']:
+                    st.write(f"**Выделенный жанр:** {response['genre']}")
+                st.write("Агент определил намерения пользователя и выбрал стратегию поиска.")
+
+            # Показываем работу второго и третьего (Retrieval & Ranking)
+            with st.status("📊 Retrieval & Ranking агенты отобрали лучшее", expanded=False):
+                st.write("Сравнение семантических векторов и ключевых слов завершено.")
+                st.write("Результаты отранжированы с учетом ваших предпочтений и истории открытий.")
+
+            # ВЫВОД ФИНАЛЬНОГО ОТВЕТА (Response Agent)
+            st.markdown("---")
+            st.subheader("📝 Ответ Response-агента")
 
             if response['type'] == 'empty':
-                st.info(response.get('message', 'Ничего не найдено'))
+                st.info("Агенты не нашли подходящих материалов в вашей локальной библиотеке.")
 
             elif response['type'] == 'vague':
-                st.success(f"📚 Найдены рекомендации по запросу: _{response.get('query', '')}_")
-                if response.get('genre'):
-                    st.caption(f"Определенный жанр: {response['genre']}")
-                if response.get('mood'):
-                    st.caption(f"🎭 Настроение: {response['mood']}")
-
+                st.success(f"🤖 Найдено по вашему запросу:")
                 for rec in response.get('recommendations', []):
-                    with st.expander(f"📖 {rec.get('title', '')} (релевантность: {rec.get('relevance_score', 0):.2f})"):
-                        last_opened = rec.get('last_opened')
-                        if last_opened:
-                            last_date = datetime.fromtimestamp(last_opened).strftime('%d.%m.%Y %H:%M')
-                            st.caption(f"📅 Последнее открытие: {last_date} | Открытий: {rec.get('open_count', 0)}")
-                        else:
-                            st.caption("📅 Книга еще не открывалась")
+                    # Делаем заголовок красивым (без ID файла)
+                    clean_title = rec['title']
+                    with st.expander(f"📖 {clean_title}"):
+                        st.write(rec['snippets'][0] if rec['snippets'] else "Нет доступного фрагмента")
+                        st.caption(f"Релевантность: {rec.get('relevance_score', 0):.2f}")
 
-                        # ========== НОВОЕ: Показываем соответствие настроению ==========
-                        if rec.get('mood_match'):
-                            st.caption(rec['mood_match'])
+            else:
+                results_list = response.get('results', response.get('answers', []))
+                for res in results_list:
+                    title = res.get('title') or res.get('book_title') or "Книга"
+                    with st.expander(f"📖 {title}"):
+                        st.write(res.get('snippet', ''))
+                        st.caption(f"Сходство: {res.get('relevance', 0):.2f}")
 
-                        for i, snippet in enumerate(rec.get('snippets', [])[:2], 1):
-                            st.markdown(f"**Отрывок {i}:**")
-                            st.markdown(f"> {snippet}")
-                            st.markdown("---")
+            st.write(f"⏱️ Суммарное время работы агентов: {elapsed:.2f} сек")
 
-            elif response['type'] == 'specific':
-                st.success(f"🔎 Точные результаты по запросу: _{response.get('query', '')}_")
+            st.session_state.history.append({
+                'Запрос': query,
+                'Время (сек)': round(elapsed, 2),
+                'Тип': response.get('type', 'simple')
+            })
 
-                for answer in response.get('answers', []):
-                    with st.expander(
-                            f"📖 {answer.get('book_title', '')} — релевантность: {answer.get('relevance', 0):.2f}"):
-                        if answer.get('exact_match'):
-                            st.markdown("✅ **Высокая точность совпадения!**")
-                        st.markdown(f"> {answer.get('snippet', '')}")
+            st.markdown("---")
+            if st.session_state.history:
+                with st.expander("📋 Журнал последних запросов", expanded=False):
+                    # Превращаем историю в таблицу для презентабельности
+                    df = pd.DataFrame(st.session_state.history).iloc[::-1]  # Последние запросы сверху
+                    st.table(df.head(5))  # Показываем 5 последних запросов
 
-            elif response['type'] == 'general':
-                st.info(f"📋 Результаты по запросу: _{response.get('query', '')}_")
-                st.caption(f"Ключевые слова: {', '.join(response.get('keywords', []))}")
-
-                for result in response.get('results', []):
-                    with st.expander(f"📖 {result.get('title', '')} — {result.get('relevance', 0):.2f}"):
-                        st.markdown(f"> {result.get('snippet', '')}")
-
-            else:  # simple search
-                st.info(f"📋 Результаты обычного поиска")
-                for result in response.get('results', []):
-                    with st.expander(f"📖 {result.get('title', '')}"):
-                        st.markdown(f"> {result.get('snippet', '')}")
-                        st.caption(f"Релевантность: {result.get('relevance', 0):.2f}")
+                    if st.button("🗑 Очистить журнал", use_container_width=True):
+                        st.session_state.history = []
+                        st.rerun()
 
         except Exception as e:
-            st.error(f"❌ Ошибка при обработке запроса: {e}")
-
-# История запросов
-if st.session_state.history:
-    with st.expander("📋 История запросов"):
-        for i, h in enumerate(reversed(st.session_state.history[-10:])):
-            st.text(f"{i + 1}. '{h['query']}' - {h['type']} ({h['time']:.2f} сек)")
+            st.error(f"❌ Критическая ошибка агента: {e}")
 
 # Информация о системе
 with st.expander("ℹ️ О системе"):
     st.markdown("""
-    ### Novellect: Мультиагентная система поиска книг
-
-    **Агенты:**
-    - **QueryAnalyzerAgent**: Анализирует запрос, определяет тип (vague/specific/general) и настроение
-    - **RetrievalAgent**: Выполняет гибридный поиск (семантика + BM25)
-    - **RankingAgent**: Специализированное ранжирование для разных типов запросов и настроений
-    - **ResponseAgent**: Форматирует ответ в зависимости от типа запроса
-
-    **Новые возможности:**
-    - 🎭 **Анализ настроения** книг при индексации
-    - 🎯 **Ранжирование по настроению** для запросов типа "хочу юморную историю"
-    - 📊 Отображение "профиля настроения" каждой книги
-
-    **Оптимизации:**
-    - Кэширование TXT-версий для быстрой повторной индексации
-    - Кэширование частых запросов
-    - Batch processing для ускорения
-    - Безопасная обработка всех типов данных
+    **Novellect Ultimate (Proto 5)**
+    - **SHA-256 Deduplication**: Умный контроль повторов.
+    - **Local Inference**: Модели работают на CPU без API.
+    - **1GB Quota**: Защита от переполнения памяти.
+    - **Multi-Agent RAG**: Анализ намерений и настроений.
     """)
-
-st.markdown("---")
-st.caption("Novellect Agent System | 2026 | Мультиагентная система с анализом настроения")
