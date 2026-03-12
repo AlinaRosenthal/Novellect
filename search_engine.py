@@ -546,13 +546,13 @@ def add_to_index(book_data, file_id):
     # Обновляем индекс книг с универсальными характеристиками
     record = {
         "id": file_id,
-        "title": title,
+        "title": book_data.get('title', 'Без названия'),
+        "file_hash": book_data.get('file_hash'),
         "format": book_data.get('format', 'unknown'),
         "chunks_count": len(chunks),
-        "added_date": datetime.now().timestamp(),
+        "added_date": time.time(),
         "last_opened": None,
-        "open_count": 0,
-        "features": book_features  # <-- сохраняем все характеристики
+        "features": book_features
     }
     index.append(record)
     save_index(index)
