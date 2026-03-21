@@ -1,7 +1,8 @@
 import re
 from datetime import datetime
 from search_engine import get_query_analyzer, get_text_analyzer
-from search_engine import search_hybrid, load_index, update_last_opened
+from search_engine import search_hybrid, load_index, update_last_opened, get_model
+from sklearn.metrics.pairwise import cosine_similarity
 
 # Глобальные анализаторы
 _query_analyzer = get_query_analyzer()
@@ -190,6 +191,14 @@ class RankingAgent:
     def __init__(self):
         self.index = load_index()
 
+    def _get_semantic_feature_score(self, text, feature_name):
+        """Вычисляет семантическую близость между текстом и названием характеристики"""
+        model = get_model()
+        # Создаем эмбеддинги для текста и названия фичи
+        t_emb = model.encode([text], show_progress_bar=False)
+        f_emb = model.encode([feature_name], show_progress_bar=False)
+        return float(cosine_similarity(t_emb, f_emb)[0][0])
+
     def rank(self, results, analysis):
         """
         Ранжирует результаты в зависимости от анализа запроса
@@ -214,70 +223,18 @@ class RankingAgent:
             return results
 
     def _rank_by_features(self, results, analysis):
-        """
-        Универсальное ранжирование по множеству характеристик
-        """
-        # Группируем результаты по книгам
-        books = {}
+        """Ранжирование на основе семантических характеристик"""
         for r in results:
-            book_id = r['book_id']
-            if book_id not in books:
-                book_info = next((b for b in self.index if b['id'] == book_id), None)
-                books[book_id] = {
-                    'book_info': book_info,
-                    'results': [],
-                    'feature_score': 0
-                }
-            books[book_id]['results'].append(r)
+            feature_boost = 0
+            for cat, priorities in analysis.get('priorities', {}).items():
+                for subcat, weight in priorities:
+                    # Если в анализе запроса есть характеристика, проверяем семантически
+                    score = self._get_semantic_feature_score(r['snippet'], subcat)
+                    feature_boost += score * weight
 
-        # Для каждой книги вычисляем соответствие запросу
-        priorities = analysis['priorities']
+            r['similarity'] += (feature_boost * 0.2)  # Небольшой вес для подстройки
 
-        for book_id, book_data in books.items():
-            book_info = book_data['book_info']
-            if book_info and 'features' in book_info:
-                book_features = book_info['features']
-
-                # Вычисляем общий score соответствия
-                total_score = 0
-                total_weight = 0
-
-                for category, cat_priorities in priorities.items():
-                    if category in book_features:
-                        for subcat, query_score in cat_priorities:
-                            book_score = book_features[category].get(subcat, 0)
-                            # Чем выше приоритет в запросе, тем больше вес
-                            weight = query_score
-                            total_score += book_score * weight
-                            total_weight += weight
-
-                if total_weight > 0:
-                    book_data['feature_score'] = total_score / total_weight
-            else:
-                book_data['feature_score'] = 0
-
-        # Сортируем книги по feature_score
-        sorted_books = sorted(
-            books.values(),
-            key=lambda x: x['feature_score'],
-            reverse=True
-        )
-
-        # Собираем результаты
-        ranked_results = []
-        for book in sorted_books:
-            # Внутри книги сортируем по релевантности
-            book_results = sorted(book['results'], key=lambda x: x['similarity'], reverse=True)
-            ranked_results.extend(book_results)
-
-        # Логируем топ-книги
-        if sorted_books:
-            print(f"[RANKING] Топ по характеристикам:")
-            for i, book in enumerate(sorted_books[:3]):
-                if book['book_info']:
-                    print(f"  {i + 1}. {book['book_info']['title']}: {book['feature_score']:.2f}")
-
-        return ranked_results
+        return sorted(results, key=lambda x: x['similarity'], reverse=True)
 
     def _rank_by_last_opened(self, results):
         """
