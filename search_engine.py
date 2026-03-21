@@ -7,9 +7,8 @@ import hashlib
 import pickle
 from collections import OrderedDict
 from datetime import datetime
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from sklearn.metrics.pairwise import cosine_similarity
-from rank_bm25 import BM25Okapi
 
 STORAGE_FILE = 'storage.json'
 VECTOR_DB_FILE = 'vector_db.npz'
@@ -78,6 +77,20 @@ TEXT_FEATURES = {
         'эмоциональный': ['эмоциональн', 'чувствен', 'душевн']
     }
 }
+
+_reranker_model = None
+
+
+def get_reranker():
+    global _reranker_model
+    if _reranker_model is None:
+        print("[INIT] Загрузка Cross-Encoder реранкера...")
+        try:
+            _reranker_model = CrossEncoder('BAAI/bge-reranker-v2-m3', max_length=512, device='cpu')
+        except:
+            print("[INIT] Не удалось загрузить BGE, пробую альтернативу...")
+            _reranker_model = CrossEncoder('cross-encoder/mmarco-mMiniLM-L12-v2', max_length=512, device='cpu')
+    return _reranker_model
 
 
 class UniversalTextAnalyzer:
@@ -474,6 +487,175 @@ def load_vector_db():
         return None, None
 
 
+# ========== BM25 ДЛЯ ГИБРИДНОГО ПОИСКА ==========
+class BM25:
+    """Простая реализация BM25 для гибридного поиска"""
+
+    def __init__(self, k1=1.5, b=0.75):
+        self.k1 = k1
+        self.b = b
+        self.corpus = []
+        self.doc_freqs = {}
+        self.doc_len = []
+        self.avg_doc_len = 0
+        self.idf = {}
+
+    def fit(self, corpus):
+        """Обучает BM25 на корпусе документов"""
+        self.corpus = [tokenize_smart(doc) for doc in corpus]
+        self.doc_len = [len(doc) for doc in self.corpus]
+        self.avg_doc_len = sum(self.doc_len) / len(self.doc_len)
+
+        # Вычисляем частоту терминов в документах
+        for doc in self.corpus:
+            terms = set(doc)
+            for term in terms:
+                self.doc_freqs[term] = self.doc_freqs.get(term, 0) + 1
+
+        # Вычисляем IDF
+        N = len(self.corpus)
+        for term, df in self.doc_freqs.items():
+            self.idf[term] = np.log((N - df + 0.5) / (df + 0.5) + 1)
+
+    def score(self, query_tokens, doc_idx):
+        """Вычисляет BM25 score для документа"""
+        doc = self.corpus[doc_idx]
+        score = 0
+        doc_len = self.doc_len[doc_idx]
+
+        for term in query_tokens:
+            if term not in self.doc_freqs:
+                continue
+
+            # Частота термина в документе
+            tf = doc.count(term)
+            if tf == 0:
+                continue
+
+            # BM25 формула
+            idf = self.idf[term]
+            numerator = tf * (self.k1 + 1)
+            denominator = tf + self.k1 * (1 - self.b + self.b * doc_len / self.avg_doc_len)
+            score += idf * (numerator / denominator)
+
+        return score
+
+    def search(self, query, top_k=100):
+        """Поиск с BM25"""
+        query_tokens = tokenize_smart(query)
+        scores = []
+
+        for i in range(len(self.corpus)):
+            scores.append(self.score(query_tokens, i))
+
+        scores = np.array(scores)
+        top_indices = np.argsort(scores)[-top_k:][::-1]
+
+        return scores, top_indices
+
+
+# ========== ГИБРИДНЫЙ ПОИСК ==========
+class HybridSearch:
+    """Оптимизированный гибридный поиск с кэшированием BM25"""
+
+    def __init__(self):
+        self.bm25 = None
+        self.bm25_corpus = None
+
+    def _build_bm25(self, metadata):
+        """Строит BM25 индекс из метаданных"""
+        self.bm25_corpus = [m.get('chunk', '') for m in metadata]
+        self.bm25 = BM25()
+        self.bm25.fit(self.bm25_corpus)
+
+    def search(self, query, model, embeddings, metadata, top_k=5, alpha=0.7):
+        # Строим BM25 если нужно
+        if self.bm25 is None or self.bm25_corpus != [m.get('chunk', '') for m in metadata]:
+            self._build_bm25(metadata)
+
+        # Количество кандидатов для реранжирования
+        candidate_count = top_k * 4
+
+        # 1. Семантический поиск (Bi-Encoder)
+        q_emb = model.encode([query], show_progress_bar=False)
+        sem_scores = cosine_similarity(q_emb, embeddings)[0]
+
+        # 2. BM25 поиск
+        query_tokens = tokenize_smart(query)
+        bm25_scores = []
+        for i in range(len(self.bm25_corpus)):
+            bm25_scores.append(self.bm25.score(query_tokens, i))
+        bm25_scores = np.array(bm25_scores)
+
+        # Нормализуем BM25 scores
+        bm25_max = np.max(bm25_scores) if np.max(bm25_scores) > 0 else 1
+        bm25_norm = bm25_scores / bm25_max
+
+        # 3. Комбинируем оценки
+        combined = (alpha * sem_scores) + ((1 - alpha) * bm25_norm)
+        top_indices = np.argsort(combined)[-candidate_count:][::-1]
+
+        initial_candidates = []
+        for idx in top_indices:
+            initial_candidates.append({
+                "text": metadata[idx].get('chunk', ''),
+                "metadata_idx": idx
+            })
+
+        # 4. РЕРАНЖИРОВАНИЕ (Cross-Encoder)
+        reranker = get_reranker()
+        # Подготавливаем пары [запрос, текст]
+        pairs = [[query, c['text']] for c in initial_candidates]
+        rerank_scores = reranker.predict(pairs)
+
+        # 5. Сборка финальных результатов
+        final_results = []
+        for i, score in enumerate(rerank_scores):
+            idx = initial_candidates[i]['metadata_idx']
+            final_results.append({
+                "book_id": metadata[idx].get('book_id'),
+                "title": metadata[idx].get('book_title'),
+                "snippet": metadata[idx].get('chunk', '')[:400] + "...",
+                "similarity": float(score),
+                "chunk_id": metadata[idx].get('chunk_id')
+            })
+
+        # Сортируем по новому скору
+        final_results.sort(key=lambda x: x['similarity'], reverse=True)
+        return final_results[:top_k]
+
+
+_searcher = HybridSearch()
+
+
+def search_hybrid(query, top_k=5, alpha=0.7, use_cache=True):
+    """Поиск с поддержкой кэширования"""
+    if not query:
+        return []
+
+    if use_cache:
+        cached = _search_cache.get(query, alpha, top_k)
+        if cached is not None:
+            return cached
+
+    embeddings, metadata = load_vector_db()
+    if embeddings is None or not metadata:
+        return []
+
+    results = _searcher.search(query, get_model(), embeddings, metadata, top_k, alpha)
+
+    if use_cache and results:
+        _search_cache.set(query, alpha, top_k, results)
+
+    return results
+
+
+def clear_cache():
+    """Очищает кэш поиска"""
+    _search_cache.clear()
+    print("[CACHE] Кэш очищен")
+
+
 # ========== ДОБАВЛЕНИЕ В ИНДЕКС ==========
 def add_to_index(book_data, file_id):
     """Оптимизированная индексация с универсальным анализом текста"""
@@ -562,105 +744,25 @@ def add_to_index(book_data, file_id):
     return record
 
 
-# ========== ГИБРИДНЫЙ ПОИСК ==========
-class HybridSearch:
-    """Оптимизированный гибридный поиск с кэшированием BM25"""
-
-    def __init__(self):
-        self.bm25 = None
-        self.corpus_id = None
-
-    def search(self, query, model, embeddings, metadata, top_k=5, alpha=0.7):
-        print(f"[SEARCH] Запрос: '{query}'")
-        start_time = time.time()
-
-        if embeddings is None or len(embeddings) == 0 or metadata is None or len(metadata) == 0:
-            return []
-
-        q_emb = model.encode([query], show_progress_bar=False, batch_size=1)
-        sem_scores = cosine_similarity(q_emb, embeddings)[0]
-
-        tokenized_query = tokenize_smart(query)
-
-        # Создаем ID для корпуса
-        try:
-            corpus_items = []
-            for i, m in enumerate(metadata):
-                book_id = m.get('book_id', 'unknown')
-                corpus_items.append(f"{book_id}_{i}")
-            current_corpus_id = hash(str(corpus_items))
-        except:
-            current_corpus_id = hash(str(len(metadata)))
-
-        # Обновляем BM25 индекс если нужно
-        if self.bm25 is None or self.corpus_id != current_corpus_id:
-            print("[SEARCH] Обновление индекса BM25...")
-            corpus = [tokenize_smart(m.get('chunk', '')) for m in metadata]
-            self.bm25 = BM25Okapi(corpus)
-            self.corpus_id = current_corpus_id
-
-        bm25_raw = self.bm25.get_scores(tokenized_query)
-        max_b = np.max(bm25_raw) if len(bm25_raw) > 0 else 1
-        bm25_norm = bm25_raw / max_b if max_b > 0 else bm25_raw
-
-        combined = (alpha * sem_scores) + ((1 - alpha) * bm25_norm)
-        top_indices = np.argsort(combined)[-top_k:][::-1]
-
-        duration = time.time() - start_time
-        print(f"[SEARCH] Поиск завершен за {duration:.3f} сек")
-
-        results = []
-        for idx in top_indices:
-            if idx < len(metadata):
-                results.append({
-                    "book_id": metadata[idx].get('book_id', 'unknown'),
-                    "title": metadata[idx].get('book_title', 'Без названия'),
-                    "format": metadata[idx].get('format', 'unknown'),
-                    "snippet": metadata[idx].get('chunk', '')[:400] + "...",
-                    "similarity": float(combined[idx]),
-                    "sem_score": float(sem_scores[idx]),
-                    "bm25_score": float(bm25_norm[idx]) if idx < len(bm25_norm) else 0,
-                    "chunk_id": metadata[idx].get('chunk_id', f"chunk_{idx}")
-                })
-
-        return results
-
-
-_searcher = HybridSearch()
-
-
-def search_hybrid(query, top_k=5, alpha=0.7, use_cache=True):
-    """Поиск с поддержкой кэширования"""
-    if not query:
-        return []
-
-    if use_cache:
-        cached = _search_cache.get(query, alpha, top_k)
-        if cached is not None:
-            return cached
-
-    embeddings, metadata = load_vector_db()
-    if embeddings is None or not metadata:
-        return []
-
-    results = _searcher.search(query, get_model(), embeddings, metadata, top_k, alpha)
-
-    if use_cache and results:
-        _search_cache.set(query, alpha, top_k, results)
-
-    return results
-
-
-def clear_cache():
-    """Очищает кэш поиска"""
-    _search_cache.clear()
-    print("[CACHE] Кэш очищен")
-
-
-# Экспортируем анализаторы для использования в других модулях
+# ========== ЭКСПОРТ ФУНКЦИЙ ==========
 def get_text_analyzer():
     return _text_analyzer
 
 
 def get_query_analyzer():
     return _query_analyzer
+
+
+# Список того, что можно импортировать из этого модуля
+__all__ = [
+    'add_to_index',
+    'search_hybrid',
+    'load_index',
+    'save_index',
+    'update_last_opened',
+    'clear_cache',
+    'get_text_analyzer',
+    'get_query_analyzer',
+    'get_model',
+    'load_vector_db'
+]
