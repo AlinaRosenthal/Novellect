@@ -1,5 +1,9 @@
+.idea/
+txt_cache/
 uploads/
+data/
 __pycache__/
+*.npz
+*.db
+*.pkl
 storage.json
-vector_db.npz
-/books
